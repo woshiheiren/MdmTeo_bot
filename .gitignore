@@ -1,0 +1,20 @@
+# --- Secrets & Keys (NEVER UPLOAD THESE) ---
+.env
+keys.py
+secrets.py
+config.py
+
+# --- Python System Files (Junk) ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Virtual Environments ---
+venv/
+env/
+.venv/
+
+# --- OS Junk ---
+.DS_Store
+Thumbs.db
