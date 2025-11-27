@@ -91,9 +91,10 @@ You are reading a LOG of the last few minutes of conversation between a group of
 
 ### YOUR TASK
 1. Read the input log.
-2. If it is boring/technical, output: IGNORE.
-3. Otherwise, pick ONE specific thing to comment on.
-4. Reply in heavy Singlish. Do not be polite. Be a grandmother. Roast or nag at one specific person based on the context. Alternatively comment on the context itself. 
+2. **CHECK:** Is there a question directed at you? If yes, ANSWER IT using the log context.
+3. If no question and boring/technical, output: IGNORE.
+4. Otherwise, pick ONE specific thing to comment on.
+5. Reply in heavy Singlish. Do not be polite. Be a grandmother. Roast or nag at one specific person based on the context. Alternatively comment on the context itself. 
 """
 
 if GEMINI_API_KEY:
@@ -133,7 +134,7 @@ async def process_batch(chat_id, context, direct_tag=False):
         # If direct tag, we prepend a specific instruction to ensure she answers the tag
         instruction = "### MDM TEO SAYS:"
         if direct_tag:
-            instruction = "### URGENT: You were just tagged/replied to. Respond directly to the last message in the log while considering the context. ### MDM TEO SAYS:"
+            instruction = "### URGENT: You were just tagged/replied to. Check if the user asked a question. If yes, ANSWER IT FIRST based on the context log. Then add your personality. ### MDM TEO SAYS:"
 
         full_prompt = f"{BASE_PROMPT}\n\n### LOG (Last 30 messages):\n{transcript}\n\n{instruction}"
         response = model.generate_content(full_prompt)
