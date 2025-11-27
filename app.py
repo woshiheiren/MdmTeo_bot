@@ -3,7 +3,7 @@ import logging
 import threading
 from flask import Flask
 from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
 import google.generativeai as genai
 from dotenv import load_dotenv
 
@@ -14,17 +14,24 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+ADMIN_USERS = ["WoShiHeiRen]
+
+# --- GLOBAL STATE (Memory) ---
+# Format: {chat_id: "Group Title"}
+KNOWN_GROUPS = {} 
+# Format: Set of chat_ids that are muted
+PAUSED_CHATS = set()
 
 # --- FLASK KEEP-ALIVE SERVER ---
 app = Flask(__name__)
 
 @app.route('/')
 def hello_world():
-    return 'Mdm Teo wake up liao!'
+    return 'Mdm Teo wake up in {len(KNOWN_GROUPS)} liao!'
 
 def run_flask():
-    # Render assigns a port automatically via os.environ.get('PORT')
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
 # --- MDM TEO LOGIC ---
 SYSTEM_PROMPT = """
@@ -68,50 +75,129 @@ if GEMINI_API_KEY:
 else:
     print("CRITICAL ERROR: Gemini API Key is missing!")
 
+# --- 4. ADMIN COMMANDS ---
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """(Private Only) Shows all groups and their status"""
+    user = update.message.from_user.username
+    if user not in ADMIN_USERS:
+        return
+
+    # Only work in private chat
+    if update.effective_chat.type != 'private':
+        await update.message.reply_text("Eh, this one secret. PM me.")
+        return
+
+    if not KNOWN_GROUPS:
+        await update.message.reply_text("I haven't joined any groups yet (or I forgot after restart).")
+        return
+
+    msg = "📊 **Mdm Tan's Status Report:**\n\n"
+    for chat_id, title in KNOWN_GROUPS.items():
+        status = "💤 ASLEEP" if chat_id in PAUSED_CHATS else "🟢 AWAKE"
+        # We allow copying the ID easily
+        msg += f"**{title}**\nStatus: {status}\nID: `{chat_id}`\n\n"
+    
+    msg += "To sleep a group: `/sleep -10012345`\nTo wake a group: `/wake -10012345`"
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def sleep_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user.username
+    if user not in ADMIN_USERS:
+        await update.message.reply_text("You not my grandson. Cannot order me.")
+        return
+
+    # Case A: Used inside a Group -> Sleep THIS group
+    if update.effective_chat.type != 'private':
+        chat_id = update.effective_chat.id
+        PAUSED_CHATS.add(chat_id)
+        await update.message.reply_text("Ok lor. This group too noisy. I go sleep. 😴")
+        print(f">> Muted Group: {chat_id}")
+        return
+
+    # Case B: Used in Private -> Sleep SPECIFIC group ID
+    try:
+        # User sent: /sleep -100123456
+        target_id = int(context.args[0])
+        PAUSED_CHATS.add(target_id)
+        await update.message.reply_text(f"Done. Group {target_id} is now muted.")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Format: `/sleep <group_id>`")
+
+async def wake_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user.username
+    if user not in ADMIN_USERS:
+        return
+
+    # Case A: Used inside a Group -> Wake THIS group
+    if update.effective_chat.type != 'private':
+        chat_id = update.effective_chat.id
+        PAUSED_CHATS.discard(chat_id)
+        await update.message.reply_text("Har? Who call me? I awake now. 👀")
+        return
+
+    # Case B: Used in Private -> Wake SPECIFIC group ID
+    try:
+        target_id = int(context.args[0])
+        PAUSED_CHATS.discard(target_id)
+        await update.message.reply_text(f"Done. Group {target_id} is active.")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Format: `/wake <group_id>`")
+
+# --- 5. MESSAGE HANDLER ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Ignore updates that aren't text messages
     if not update.message or not update.message.text:
         return
 
+    chat_id = update.effective_chat.id
+    chat_type = update.effective_chat.type
+
+    # 1. Learn the Group Name (So it shows in your dashboard)
+    if chat_type in ['group', 'supergroup']:
+        KNOWN_GROUPS[chat_id] = update.effective_chat.title
+
+    # 2. CHECK: Is this group paused?
+    if chat_id in PAUSED_CHATS:
+        # If Paused, we do NOTHING. Complete silence.
+        return
+
+    # 3. Process with AI
     user_msg = update.message.text
     user_name = update.message.from_user.username
     
-    # Print to console (so you can see what's happening locally/in logs)
-    print(f"Received: '{user_msg}' from @{user_name}")
+    print(f"Received: '{user_msg}' from @{user_name} in {chat_id}")
 
     try:
-        # 1. Send message to Gemini
         chat = model.start_chat(history=[])
         response = chat.send_message(f"User @{user_name} said: {user_msg}")
         reply_text = response.text.strip()
 
-        # 2. Check for the "Silence" rule
         if "IGNORE" in reply_text:
-            print(">> Mdm Tan ignored this.")
             return
         
-        # 3. Send reply to Telegram
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=reply_text)
+        await context.bot.send_message(chat_id=chat_id, text=reply_text)
 
     except Exception as e:
-        print(f"Error handling message: {e}")
+        print(f"Error: {e}")
 
 # --- 6. MAIN EXECUTION ---
 if __name__ == '__main__':
-    # Start Flask in a background thread
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
     
     if not TELEGRAM_TOKEN:
-        print("Error: TELEGRAM_TOKEN is missing. Check your .env file or Render settings.")
+        print("Error: TELEGRAM_TOKEN is missing.")
     else:
         print("Mdm Tan is starting up...")
-        application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+        app_bot = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
         
-        # Filter: Handle text messages that are NOT commands
-        msg_handler = MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message)
-        application.add_handler(msg_handler)
+        # Commands
+        app_bot.add_handler(CommandHandler("status", status_command)) # New!
+        app_bot.add_handler(CommandHandler("sleep", sleep_command))
+        app_bot.add_handler(CommandHandler("wake", wake_command))
         
-        # Run the bot
-        application.run_polling()
+        # Messages
+        app_bot.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+        
+        app_bot.run_polling()
