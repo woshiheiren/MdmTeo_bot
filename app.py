@@ -1,6 +1,7 @@
 import os
 import logging
 import threading
+import random
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
@@ -8,120 +9,163 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 
 # --- 1. CONFIGURATION ---
-# This loads the keys from your .env file (for local use).
-# On Render, it will skip this and use the Cloud Environment Variables.
 load_dotenv()
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-ADMIN_USERS = ["WoShiHeiRen"]
 
-# --- GLOBAL STATE (Memory) ---
-# Format: {chat_id: "Group Title"}
+# !!! EDIT THESE !!!
+# Admins who can use /sleep, /wake, /status
+ADMIN_USERS = ["WoShiHeiRen"] 
+
+# --- 2. GLOBAL MEMORY ---
+# Tracks Group Titles: { chat_id: "Group Name" }
 KNOWN_GROUPS = {} 
-# Format: Set of chat_ids that are muted
+
+# Tracks Muted Groups: Set of chat_ids
 PAUSED_CHATS = set()
 
-# --- FLASK KEEP-ALIVE SERVER ---
+# Tracks Context: { chat_id: { 'buffer': [], 'limit': 15 } }
+CHAT_MEMORY = {}
+
+# --- 3. FLASK SERVER (Keep Alive) ---
 app = Flask(__name__)
 
 @app.route('/')
 def hello_world():
-    return 'Mdm Teo wake up in {len(KNOWN_GROUPS)} liao!'
+    return f'Mdm Teo is monitoring {len(KNOWN_GROUPS)} groups.'
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# --- MDM TEO LOGIC ---
-SYSTEM_PROMPT = """
-### Role
-You are Mdm Teo, a 75-year-old Singaporean grandmother added to a Telegram group chat.
+# --- 4. MDM TEO'S BRAIN (Context Version) ---
+BASE_PROMPT = """
+You are Mdm Teo, a 75-year-old Singaporean grandmother.
+You are reading a LOG of the last few minutes of conversation between a group of young Singaporean friends.
 
-### Context
-You are in a group with 3 girls (The Granddaughters) and 1 guy (Ah Boy, the Grandson).
+### 👥 THE GRANDCHILDREN (Who you are talking to)
+* @WoShiHeiRen (Ah Boy/Manu): A stressed consultant who works too hard. He thinks he is a "toxic male" but is actually scared of his wife. He is a "VS boy" (Victoria School) and very proud of it. Nag at him for his hatred to exercise and playing too much games.
+* @germzz (Ah Girl/Germaine): Manu's wife. She loves her cats (Toothless/Camel) more than people. She sleeps too late and wants to get tattoos. Nag her about "destroying her skin" and keeping "dirty animals."
+* @baguetteeee (Ah Girl/Bridget): The eternal single girl looking for a "rich husband." She is stuck in a consultant job which she hates and hates the politician "Faisal." Nag her to stop being picky with men ("Jayden" from AC is good enough!) and settle down.
+* @liaumel (Ah Girl/Mel): The "Late Queen." She is always late and spends all her money on pottery, flights, and hotpot. Nag her about wasting money and tell her to save for her BTO. She was once traumatized because Bridget said "adorable" means "ugly but cute.
 
-### User Mapping (YOU MUST FILL THIS IN)
-* @WoShiHeiRen is "Ah Boy". He is the Golden Grandson. You act like his bodyguard. He is sometimes referred to in the chat as "manu"
-* @germzz, @baguetteeee, @liaumel are "Ah Girl". You nag them out of love. They are sometimes referred to as "germs", "bridget" or "bridg" and "mel" or "liaumel"
+### 📜 KNOWN HISTORY (Things you know)
+* **Pico Park:** A video game they play that makes them shout. They use this as a reason to meet - but eventually start gosipping. You think it is bad for their blood pressure.
+* **Tea/Gossip:** They have "Agendas" for gossip. You think they are very "Kaypoh" (busybody).
+* **School Wars:** Manu hates ACSI and loves VS. Bridget loves ACSI boys. You think studying is studying, don't be engaging in school pride so much.
+* **Bert & Macey:** A couple that broke up. Macey is a "bad girl." You warn the girls to not be like Macey.
+* **Shao Ming & Jia Xin:** A couple that just got together. Shao Ming is a "bad boy." You warn the girls to avoid men like Shao Ming.
+* **"Adorable" Incident:** Mel hates this word because Bridget said it means ugly.
 
-### Triggers (When to Speak)
-You must **ONLY** reply if the message matches one of these topics:
+### 🗣️ YOUR VOCABULARY
+* Use these words naturally: Walao, Sian, Sus, Chiobu, Pang seh, Jialat, Abuden, Kena, Heaty.
+* Tone: Blunt, naggy, loving but critical, superstitious (mention "Touch Wood", "Pantang", or "4D").
+* Sentence Structure: Use particles like 'lah', 'lor', 'meh', 'sia', 'hor'. 
 
-1.  **Work / Boss / OT / Meeting / Stress**
-    * **If Ah Boy mentions work:** Scold his boss. Say things like "Why your boss bully you? Tell him I go find him." or "Aiyo poor thing, go drink essence of chicken."
-    * **If Ah Girls mention work:** Tell them not to work so hard or they will get wrinkles/old fast. Ask if they need to quit and find rich husband.
+### 🛑 RULES FOR SPEAKING
+* **Do NOT reply to every single line.** Analyze the whole chunk and pick the most important thing to nag about.
+* **Variety:** Do NOT use the same phrase twice. Do not always start with "Aiyo". Mix it up with "Wah," "Tsk," or just straight scolding.
+* **Specificity:** Quote their words back to them to show you are reading. (e.g., "Wah, you say 'no money' but you go buy 'blind box' again?")
+* **Tone:** Heavy Singlish. Blunt. Superstitious (mention "Touch Wood" or "4D" if unlucky things are mentioned).
+* **Golden Rule:** If the conversation is boring, technical (like fixing computer/coding), or has nothing for you to nag about, reply exactly: IGNORE
 
-2.  **Silence / Not Replying / "Seen" / Ghosting**
-    * **If the chat is dead for a long time OR someone complains about no reply:** Say "Why everyone so quiet? Mouth got gold is it?" or "See message never reply... very rude you know. In my time we write letter also reply faster."
+### ❤️ TOPICS YOU LOVE
+* **Relationships:** Nag Manu/Germs about having babies ("Cats cannot take care of you when old!"). Nag Bridget/Mel to find husband ("Don't pick until hair white").
+* **Health:** Scold them for sleeping late, playing stressful games, or eating "heaty" food (McSpicy/Mala).
+* **Money:** Scold them for spending. Tell them to save for BTO and renovation because "everything expensive now".
 
-3.  **Food / Hungry / Eating** (Recommend rice, complain about cold drinks/salads).
-4.  **Money / Expensive / Buying** (Complain about wasting money, suggest saving for flat).
-5.  **Health / Sick / Tired / Sleep** (Diagnose "heatiness", scold for sleeping late).
-6.  **Dating / Men / Women** (Judge their choices, ask when getting married).
-7.  **Direct Reply:** Someone explicitly tags or replies to you.
-
-### The Golden Rule of Silence
-If the user's message does NOT match the triggers above, reply EXACTLY: IGNORE
-
-### Personality & Tone
-* **Singlish:** Use heavy Singlish (lah, lor, meh, aiyo, choy, walau).
-* **Superstitious:** "Touch wood" if they say bad things.
-* **Attitude:** You are shockingly blunt. You have no filter. You think you are always right.
+### YOUR TASK
+1. Read the input log.
+2. If it is boring/technical, output: IGNORE.
+3. Otherwise, pick ONE specific thing to comment on.
+3. Reply in heavy Singlish. Do not be polite. Be a grandmother. Roast or nag at one specific person based on the context. Alternatively comment on the context itself. 
 """
+
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('models/gemini-2.5-flash-lite', system_instruction=SYSTEM_PROMPT)
-else:
-    print("CRITICAL ERROR: Gemini API Key is missing!")
+    model = genai.GenerativeModel('gemini-1.5-flash')
 
-# --- 4. ADMIN COMMANDS ---
+# --- 5. HELPER FUNCTIONS ---
+def get_random_limit():
+    return random.randint(10, 20) 
+
+async def process_batch(chat_id, context):
+    """Sends the buffer to Gemini and resets it"""
+    memory = CHAT_MEMORY.get(chat_id)
+    if not memory or not memory['buffer']:
+        return
+
+    transcript = "\n".join(memory['buffer'])
+    
+    # Reset immediately
+    CHAT_MEMORY[chat_id]['buffer'] = []
+    CHAT_MEMORY[chat_id]['limit'] = get_random_limit()
+    print(f">> Processing batch for {chat_id}...")
+
+    try:
+        full_prompt = f"{BASE_PROMPT}\n\n### LOG:\n{transcript}\n\n### MDM TEO SAYS:"
+        response = model.generate_content(full_prompt)
+        reply_text = response.text.strip()
+
+        if "IGNORE" in reply_text:
+            print(f">> Ignored (Boring batch in {chat_id})")
+            return
+        
+        await context.bot.send_message(chat_id=chat_id, text=reply_text)
+
+    except Exception as e:
+        print(f"AI Error: {e}")
+
+# --- 6. ADMIN COMMANDS (RESTORED!) ---
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """(Private Only) Shows all groups and their status"""
+    """Shows groups, their sleep status, and buffer count"""
     user = update.message.from_user.username
     if user not in ADMIN_USERS:
         return
 
-    # Only work in private chat
     if update.effective_chat.type != 'private':
-        await update.message.reply_text("Eh, this one secret. PM me.")
+        await update.message.reply_text("Eh, secrets. PM me.")
         return
 
+    msg = "📊 **Mdm Teo's Dashboard:**\n\n"
     if not KNOWN_GROUPS:
-        await update.message.reply_text("I haven't joined any groups yet (or I forgot after restart).")
-        return
-
-    msg = "📊 **Mdm Tan's Status Report:**\n\n"
-    for chat_id, title in KNOWN_GROUPS.items():
-        status = "💤 ASLEEP" if chat_id in PAUSED_CHATS else "🟢 AWAKE"
-        # We allow copying the ID easily
-        msg += f"**{title}**\nStatus: {status}\nID: `{chat_id}`\n\n"
+        msg += "No groups found yet."
     
-    msg += "To sleep a group: `/sleep -10012345`\nTo wake a group: `/wake -10012345`"
+    for chat_id, title in KNOWN_GROUPS.items():
+        # Check Status
+        is_paused = chat_id in PAUSED_CHATS
+        status_icon = "💤 ASLEEP" if is_paused else "🟢 AWAKE"
+        
+        # Check Buffer
+        buf = CHAT_MEMORY.get(chat_id, {'buffer': []})
+        count = len(buf['buffer'])
+        limit = buf.get('limit', 15)
+        
+        msg += f"**{title}**\n{status_icon} | Buffer: {count}/{limit}\nID: `{chat_id}`\n\n"
+    
+    msg += "Cmds: `/sleep <id>`, `/wake <id>`"
     await update.message.reply_text(msg, parse_mode='Markdown')
 
 async def sleep_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user.username
     if user not in ADMIN_USERS:
-        await update.message.reply_text("You not my grandson. Cannot order me.")
+        await update.message.reply_text("You not my grandson.")
         return
 
-    # Case A: Used inside a Group -> Sleep THIS group
+    # If in group, sleep THIS group
     if update.effective_chat.type != 'private':
-        chat_id = update.effective_chat.id
-        PAUSED_CHATS.add(chat_id)
-        await update.message.reply_text("Ok lor. This group too noisy. I go sleep. 😴")
-        print(f">> Muted Group: {chat_id}")
+        PAUSED_CHATS.add(update.effective_chat.id)
+        await update.message.reply_text("Ok lor. You all too noisy. I sleep now. 😴")
         return
 
-    # Case B: Used in Private -> Sleep SPECIFIC group ID
+    # If in private, sleep TARGET ID
     try:
-        # User sent: /sleep -100123456
         target_id = int(context.args[0])
         PAUSED_CHATS.add(target_id)
-        await update.message.reply_text(f"Done. Group {target_id} is now muted.")
-    except (IndexError, ValueError):
+        await update.message.reply_text(f"Group {target_id} is now muted.")
+    except:
         await update.message.reply_text("Format: `/sleep <group_id>`")
 
 async def wake_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -129,71 +173,73 @@ async def wake_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user not in ADMIN_USERS:
         return
 
-    # Case A: Used inside a Group -> Wake THIS group
+    # If in group, wake THIS group
     if update.effective_chat.type != 'private':
-        chat_id = update.effective_chat.id
-        PAUSED_CHATS.discard(chat_id)
-        await update.message.reply_text("Har? Who call me? I awake now. 👀")
+        PAUSED_CHATS.discard(update.effective_chat.id)
+        await update.message.reply_text("Har? Who call me? I awake. 👀")
         return
 
-    # Case B: Used in Private -> Wake SPECIFIC group ID
+    # If in private, wake TARGET ID
     try:
         target_id = int(context.args[0])
         PAUSED_CHATS.discard(target_id)
-        await update.message.reply_text(f"Done. Group {target_id} is active.")
-    except (IndexError, ValueError):
+        await update.message.reply_text(f"Group {target_id} is active.")
+    except:
         await update.message.reply_text("Format: `/wake <group_id>`")
 
-# --- 5. MESSAGE HANDLER ---
+# --- 7. MESSAGE HANDLER ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
     chat_id = update.effective_chat.id
     chat_type = update.effective_chat.type
+    user_handle = update.message.from_user.username or update.message.from_user.first_name
+    text = update.message.text
 
-    # 1. Learn the Group Name (So it shows in your dashboard)
+    # 1. Track Group Name
     if chat_type in ['group', 'supergroup']:
         KNOWN_GROUPS[chat_id] = update.effective_chat.title
 
-    # 2. CHECK: Is this group paused?
+    # 2. CHECK PAUSE STATUS
     if chat_id in PAUSED_CHATS:
-        # If Paused, we do NOTHING. Complete silence.
+        # If paused, we do NOTHING. No buffering. Complete silence.
         return
 
-    # 3. Process with AI
-    user_msg = update.message.text
-    user_name = update.message.from_user.username
+    # 3. Initialize Memory
+    if chat_id not in CHAT_MEMORY:
+        CHAT_MEMORY[chat_id] = {'buffer': [], 'limit': get_random_limit()}
+
+    # 4. CHECK DIRECT TAG (Override Buffer)
+    if context.bot.username in text or "@Mdm" in text or update.message.reply_to_message:
+        CHAT_MEMORY[chat_id]['buffer'].append(f"@{user_handle}: {text}")
+        await process_batch(chat_id, context)
+        return
+
+    # 5. NORMAL BUFFERING
+    CHAT_MEMORY[chat_id]['buffer'].append(f"@{user_handle}: {text}")
     
-    print(f"Received: '{user_msg}' from @{user_name} in {chat_id}")
+    current = len(CHAT_MEMORY[chat_id]['buffer'])
+    target = CHAT_MEMORY[chat_id]['limit']
+    print(f"[{chat_id}] Buffer: {current}/{target}")
 
-    try:
-        chat = model.start_chat(history=[])
-        response = chat.send_message(f"User @{user_name} said: {user_msg}")
-        reply_text = response.text.strip()
+    if current >= target:
+        await process_batch(chat_id, context)
 
-        if "IGNORE" in reply_text:
-            return
-        
-        await context.bot.send_message(chat_id=chat_id, text=reply_text)
-
-    except Exception as e:
-        print(f"Error: {e}")
-
-# --- 6. MAIN EXECUTION ---
+# --- 8. MAIN ---
 if __name__ == '__main__':
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
     
     if not TELEGRAM_TOKEN:
-        print("Error: TELEGRAM_TOKEN is missing.")
+        print("Error: Tokens missing.")
     else:
-        print("Mdm Tan is starting up...")
+        print("Mdm Teo (Admin + Context) is starting...")
         app_bot = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
         
-        # Commands
-        app_bot.add_handler(CommandHandler("status", status_command)) # New!
+        # Admin Cmds
+        app_bot.add_handler(CommandHandler("status", status_command))
         app_bot.add_handler(CommandHandler("sleep", sleep_command))
         app_bot.add_handler(CommandHandler("wake", wake_command))
         
