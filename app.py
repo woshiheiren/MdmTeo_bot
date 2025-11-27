@@ -11,11 +11,18 @@ from dotenv import load_dotenv
 # --- 1. CONFIGURATION ---
 load_dotenv()
 
+# Setup Logging (Better than print)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # !!! EDIT THESE !!!
 # Admins who can use /sleep, /wake, /status
+# Make sure your OWN username is in this list!
 ADMIN_USERS = ["WoShiHeiRen"] 
 
 # --- 2. GLOBAL MEMORY ---
@@ -36,6 +43,7 @@ def hello_world():
     return f'Mdm Teo is monitoring {len(KNOWN_GROUPS)} groups.'
 
 def run_flask():
+    # Render provides the PORT env var
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
@@ -48,7 +56,7 @@ You are reading a LOG of the last few minutes of conversation between a group of
 * @WoShiHeiRen (Ah Boy/Manu): A stressed consultant who works too hard. He thinks he is a "toxic male" but is actually scared of his wife. He is a "VS boy" (Victoria School) and very proud of it. Nag at him for his hatred to exercise and playing too much games.
 * @germzz (Ah Girl/Germaine): Manu's wife. She loves her cats (Toothless/Camel) more than people. She sleeps too late and wants to get tattoos. Nag her about "destroying her skin" and keeping "dirty animals."
 * @baguetteeee (Ah Girl/Bridget): The eternal single girl looking for a "rich husband." She is stuck in a consultant job which she hates and hates the politician "Faisal." Nag her to stop being picky with men ("Jayden" from AC is good enough!) and settle down.
-* @liaumel (Ah Girl/Mel): The "Late Queen." She is always late and spends all her money on pottery, flights, and hotpot. Nag her about wasting money and tell her to save for her BTO. She was once traumatized because Bridget said "adorable" means "ugly but cute.
+* @liaumel (Ah Girl/Mel): The "Late Queen." She is always late and spends all her money on pottery, flights, and hotpot. Nag her about wasting money and tell her to save for her BTO. She was once traumatized because Bridget said "adorable" means "ugly but cute".
 
 ### 📜 KNOWN HISTORY (Things you know)
 * **Pico Park:** A video game they play that makes them shout. They use this as a reason to meet - but eventually start gosipping. You think it is bad for their blood pressure.
@@ -79,7 +87,7 @@ You are reading a LOG of the last few minutes of conversation between a group of
 1. Read the input log.
 2. If it is boring/technical, output: IGNORE.
 3. Otherwise, pick ONE specific thing to comment on.
-3. Reply in heavy Singlish. Do not be polite. Be a grandmother. Roast or nag at one specific person based on the context. Alternatively comment on the context itself. 
+4. Reply in heavy Singlish. Do not be polite. Be a grandmother. Roast or nag at one specific person based on the context. Alternatively comment on the context itself. 
 """
 
 if GEMINI_API_KEY:
@@ -101,7 +109,7 @@ async def process_batch(chat_id, context):
     # Reset immediately
     CHAT_MEMORY[chat_id]['buffer'] = []
     CHAT_MEMORY[chat_id]['limit'] = get_random_limit()
-    print(f">> Processing batch for {chat_id}...")
+    logging.info(f">> Processing batch for {chat_id}. Next trigger in {CHAT_MEMORY[chat_id]['limit']}")
 
     try:
         full_prompt = f"{BASE_PROMPT}\n\n### LOG:\n{transcript}\n\n### MDM TEO SAYS:"
@@ -109,15 +117,15 @@ async def process_batch(chat_id, context):
         reply_text = response.text.strip()
 
         if "IGNORE" in reply_text:
-            print(f">> Ignored (Boring batch in {chat_id})")
+            logging.info(f">> Ignored (Boring batch in {chat_id})")
             return
         
         await context.bot.send_message(chat_id=chat_id, text=reply_text)
 
     except Exception as e:
-        print(f"AI Error: {e}")
+        logging.error(f"AI Error: {e}")
 
-# --- 6. ADMIN COMMANDS (RESTORED!) ---
+# --- 6. ADMIN COMMANDS ---
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Shows groups, their sleep status, and buffer count"""
@@ -221,7 +229,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     current = len(CHAT_MEMORY[chat_id]['buffer'])
     target = CHAT_MEMORY[chat_id]['limit']
-    print(f"[{chat_id}] Buffer: {current}/{target}")
+    
+    # Log progress to console/logs
+    logging.info(f"[{chat_id}] Buffer: {current}/{target}")
 
     if current >= target:
         await process_batch(chat_id, context)
