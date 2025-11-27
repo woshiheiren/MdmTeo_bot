@@ -113,14 +113,23 @@ def get_random_limit(chat_id):
     else:
         return random.randint(10, 20) # Normal
 
-async def process_batch(chat_id, context, direct_tag=False):
+async def process_batch(chat_id, context, direct_tag=False, tag_message=None):
     """Sends the accumulated history to Gemini and resets the counter"""
     memory = CHAT_MEMORY.get(chat_id)
     if not memory or not memory['history']:
         return
 
-    # Create transcript from the last 30 messages stored in deque
-    transcript = "\n".join(memory['history'])
+    # If it is a direct tag, we use the message *passed in* as the focus,
+    # and the history as purely background context.
+    # We EXCLUDE the tag message from the transcript to avoid double-processing confusion.
+    transcript_msgs = list(memory['history'])
+    if direct_tag and tag_message:
+        # If the last message in history is the tag itself, remove it from context 
+        # so we can present it separately as the "Active Question"
+        if transcript_msgs and tag_message in transcript_msgs[-1]:
+             transcript_msgs.pop()
+    
+    transcript = "\n".join(transcript_msgs)
     
     # Reset the COUNTER (not the history) immediately
     # We keep history so future messages still have context
