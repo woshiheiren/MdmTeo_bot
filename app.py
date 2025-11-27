@@ -2,6 +2,7 @@ import os
 import logging
 import threading
 import random
+from collections import deque
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
@@ -11,7 +12,7 @@ from dotenv import load_dotenv
 # --- 1. CONFIGURATION ---
 load_dotenv()
 
-# Setup Logging (Better than print)
+# Setup Logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -21,8 +22,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # !!! EDIT THESE !!!
-# Admins who can use /sleep, /wake, /status
-# Make sure your OWN username is in this list!
+# Admins who can use /sleep, /wake, /status, /say, /mood
 ADMIN_USERS = ["WoShiHeiRen"] 
 
 # --- 2. GLOBAL MEMORY ---
@@ -32,8 +32,12 @@ KNOWN_GROUPS = {}
 # Tracks Muted Groups: Set of chat_ids
 PAUSED_CHATS = set()
 
-# Tracks Context: { chat_id: { 'buffer': [], 'limit': 15 } }
+# Tracks Context: { chat_id: { 'history': deque(maxlen=30), 'counter': 0, 'limit': 15 } }
+# We use deque(maxlen=30) to automatically keep only the last 30 messages
 CHAT_MEMORY = {}
+
+# Tracks Moods: { chat_id: 'angry' | 'normal' | 'chill' }
+GROUP_MOODS = {}
 
 # --- 3. FLASK SERVER (Keep Alive) ---
 app = Flask(__name__)
@@ -43,7 +47,6 @@ def hello_world():
     return f'Mdm Teo is monitoring {len(KNOWN_GROUPS)} groups.'
 
 def run_flask():
-    # Render provides the PORT env var
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
@@ -92,34 +95,55 @@ You are reading a LOG of the last few minutes of conversation between a group of
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    model = genai.GenerativeModel('models/gemini-2.5-flash-lite')
 
 # --- 5. HELPER FUNCTIONS ---
-def get_random_limit():
-    return random.randint(10, 20) 
+def get_random_limit(chat_id):
+    """Determines how chatty she is based on the group's Mood"""
+    mood = GROUP_MOODS.get(chat_id, 'normal')
+    
+    if mood == 'angry':
+        return random.randint(2, 5)   # Yapping constantly
+    elif mood == 'chill':
+        return random.randint(30, 50) # Barely speaks
+    else:
+        return random.randint(10, 20) # Normal
 
-async def process_batch(chat_id, context):
-    """Sends the buffer to Gemini and resets it"""
+async def process_batch(chat_id, context, direct_tag=False):
+    """Sends the accumulated history to Gemini and resets the counter"""
     memory = CHAT_MEMORY.get(chat_id)
-    if not memory or not memory['buffer']:
+    if not memory or not memory['history']:
         return
 
-    transcript = "\n".join(memory['buffer'])
+    # Create transcript from the last 30 messages stored in deque
+    transcript = "\n".join(memory['history'])
     
-    # Reset immediately
-    CHAT_MEMORY[chat_id]['buffer'] = []
-    CHAT_MEMORY[chat_id]['limit'] = get_random_limit()
-    logging.info(f">> Processing batch for {chat_id}. Next trigger in {CHAT_MEMORY[chat_id]['limit']}")
+    # Reset the COUNTER (not the history) immediately
+    # We keep history so future messages still have context
+    CHAT_MEMORY[chat_id]['counter'] = 0
+    CHAT_MEMORY[chat_id]['limit'] = get_random_limit(chat_id)
+    
+    trigger_type = "DIRECT TAG" if direct_tag else "BUFFER FULL"
+    logging.info(f">> Processing batch for {chat_id} ({trigger_type}). Next trigger in {CHAT_MEMORY[chat_id]['limit']}")
 
     try:
-        full_prompt = f"{BASE_PROMPT}\n\n### LOG:\n{transcript}\n\n### MDM TEO SAYS:"
+        # If direct tag, we prepend a specific instruction to ensure she answers the tag
+        instruction = "### MDM TEO SAYS:"
+        if direct_tag:
+            instruction = "### URGENT: You were just tagged/replied to. Respond directly to the last message in the log while considering the context. ### MDM TEO SAYS:"
+
+        full_prompt = f"{BASE_PROMPT}\n\n### LOG (Last 30 messages):\n{transcript}\n\n{instruction}"
         response = model.generate_content(full_prompt)
         reply_text = response.text.strip()
 
-        if "IGNORE" in reply_text:
+        if "IGNORE" in reply_text and not direct_tag:
             logging.info(f">> Ignored (Boring batch in {chat_id})")
             return
         
+        # If direct tag, she MUST speak, even if she wanted to ignore
+        if "IGNORE" in reply_text and direct_tag:
+            reply_text = "Har? You call me for what? I busy watching drama."
+
         await context.bot.send_message(chat_id=chat_id, text=reply_text)
 
     except Exception as e:
@@ -128,7 +152,7 @@ async def process_batch(chat_id, context):
 # --- 6. ADMIN COMMANDS ---
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Shows groups, their sleep status, and buffer count"""
+    """(Private) Shows groups, mood, sleep status, and buffer"""
     user = update.message.from_user.username
     if user not in ADMIN_USERS:
         return
@@ -144,17 +168,78 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for chat_id, title in KNOWN_GROUPS.items():
         # Check Status
         is_paused = chat_id in PAUSED_CHATS
-        status_icon = "💤 ASLEEP" if is_paused else "🟢 AWAKE"
+        mood = GROUP_MOODS.get(chat_id, 'normal').upper()
+        status_icon = "💤 ASLEEP" if is_paused else f"🟢 AWAKE ({mood})"
         
         # Check Buffer
-        buf = CHAT_MEMORY.get(chat_id, {'buffer': []})
-        count = len(buf['buffer'])
-        limit = buf.get('limit', 15)
+        # Default initialization for display if missing
+        mem = CHAT_MEMORY.get(chat_id, {'counter': 0, 'limit': 15})
+        count = mem['counter']
+        limit = mem['limit']
         
         msg += f"**{title}**\n{status_icon} | Buffer: {count}/{limit}\nID: `{chat_id}`\n\n"
     
-    msg += "Cmds: `/sleep <id>`, `/wake <id>`"
+    msg += "Cmds:\n`/say <id> <msg>`\n`/mood <id> <angry|normal|chill>`\n`/sleep <id>`\n`/wake <id>`"
     await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def say_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """(Private) Forces the bot to send a message to a specific group"""
+    user = update.message.from_user.username
+    if user not in ADMIN_USERS:
+        return
+
+    if update.effective_chat.type != 'private':
+        await update.message.reply_text("This command is for private chat only.")
+        return
+
+    try:
+        # Args: [group_id, message...]
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: `/say <group_id> <message>`")
+            return
+        
+        target_id = int(context.args[0])
+        message = " ".join(context.args[1:])
+        
+        await context.bot.send_message(chat_id=target_id, text=message)
+        await update.message.reply_text(f"✅ Sent to {target_id}: \"{message}\"")
+        
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+async def mood_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """(Private) Changes the nagging frequency for a group"""
+    user = update.message.from_user.username
+    if user not in ADMIN_USERS:
+        return
+
+    if update.effective_chat.type != 'private':
+        await update.message.reply_text("This command is for private chat only.")
+        return
+
+    try:
+        # Args: [group_id, mood]
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: `/mood <group_id> <angry|normal|chill>`")
+            return
+            
+        target_id = int(context.args[0])
+        mood = context.args[1].lower()
+        
+        if mood not in ['angry', 'normal', 'chill']:
+            await update.message.reply_text("Mood must be: angry, normal, or chill.")
+            return
+            
+        GROUP_MOODS[target_id] = mood
+        
+        # Reset the limit immediately based on new mood
+        if target_id in CHAT_MEMORY:
+             CHAT_MEMORY[target_id]['limit'] = get_random_limit(target_id)
+             
+        await update.message.reply_text(f"✅ Set mood for {target_id} to **{mood}**.")
+        
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
 
 async def sleep_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user.username
@@ -205,36 +290,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_handle = update.message.from_user.username or update.message.from_user.first_name
     text = update.message.text
 
+    # Log every text message received
+    logging.info(f"Received: '{text}' from @{user_handle} in {chat_id}")
+
     # 1. Track Group Name
     if chat_type in ['group', 'supergroup']:
         KNOWN_GROUPS[chat_id] = update.effective_chat.title
 
     # 2. CHECK PAUSE STATUS
     if chat_id in PAUSED_CHATS:
-        # If paused, we do NOTHING. No buffering. Complete silence.
         return
 
-    # 3. Initialize Memory
+    # 3. Initialize Memory if needed
     if chat_id not in CHAT_MEMORY:
-        CHAT_MEMORY[chat_id] = {'buffer': [], 'limit': get_random_limit()}
+        CHAT_MEMORY[chat_id] = {
+            'history': deque(maxlen=30), # Store last 30 msgs forever (rolling)
+            'counter': 0,               # Count since last reply
+            'limit': get_random_limit(chat_id)
+        }
 
-    # 4. CHECK DIRECT TAG (Override Buffer)
+    # 4. Add to History (Context)
+    CHAT_MEMORY[chat_id]['history'].append(f"@{user_handle}: {text}")
+    CHAT_MEMORY[chat_id]['counter'] += 1
+
+    # 5. CHECK DIRECT TAG (Override Buffer)
     if context.bot.username in text or "@Mdm" in text or update.message.reply_to_message:
-        CHAT_MEMORY[chat_id]['buffer'].append(f"@{user_handle}: {text}")
-        await process_batch(chat_id, context)
+        # Force reply with full context context
+        await process_batch(chat_id, context, direct_tag=True)
         return
 
-    # 5. NORMAL BUFFERING
-    CHAT_MEMORY[chat_id]['buffer'].append(f"@{user_handle}: {text}")
-    
-    current = len(CHAT_MEMORY[chat_id]['buffer'])
+    # 6. NORMAL BUFFERING
+    current = CHAT_MEMORY[chat_id]['counter']
     target = CHAT_MEMORY[chat_id]['limit']
     
-    # Log progress to console/logs
-    logging.info(f"[{chat_id}] Buffer: {current}/{target}")
+    # Log progress
+    logging.info(f"[{chat_id}] Counter: {current}/{target}")
 
     if current >= target:
-        await process_batch(chat_id, context)
+        await process_batch(chat_id, context, direct_tag=False)
 
 # --- 8. MAIN ---
 if __name__ == '__main__':
@@ -245,13 +338,15 @@ if __name__ == '__main__':
     if not TELEGRAM_TOKEN:
         print("Error: Tokens missing.")
     else:
-        print("Mdm Teo (Admin + Context) is starting...")
+        print("Mdm Teo (Admin + Context + Moods) is starting...")
         app_bot = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
         
         # Admin Cmds
         app_bot.add_handler(CommandHandler("status", status_command))
         app_bot.add_handler(CommandHandler("sleep", sleep_command))
         app_bot.add_handler(CommandHandler("wake", wake_command))
+        app_bot.add_handler(CommandHandler("say", say_command))
+        app_bot.add_handler(CommandHandler("mood", mood_command))
         
         # Messages
         app_bot.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
