@@ -2,6 +2,8 @@ import os
 import logging
 import threading
 import random
+import time
+import requests
 from collections import deque
 from flask import Flask
 from telegram import Update
@@ -49,6 +51,28 @@ def hello_world():
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    """Pings the web server every 5 minutes to prevent Render from sleeping"""
+    # Render automatically sets this variable. If not found, default to localhost.
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
+        url = "http://127.0.0.1:8080"
+        
+    logging.info(f"Keep-alive monitor started. Target: {url}")
+    
+    # Wait for the server to start up
+    time.sleep(10)
+    
+    while True:
+        try:
+            response = requests.get(url)
+            logging.info(f"Self-ping successful: {response.status_code}")
+        except Exception as e:
+            logging.error(f"Self-ping failed: {e}")
+        
+        # Sleep for 5 minutes (300 seconds)
+        time.sleep(300)
 
 # --- 4. MDM TEO'S BRAIN (Context Version) ---
 BASE_PROMPT = """
@@ -140,10 +164,16 @@ async def process_batch(chat_id, context, direct_tag=False, tag_message=None):
     logging.info(f">> Processing batch for {chat_id} ({trigger_type}). Next trigger in {CHAT_MEMORY[chat_id]['limit']}")
 
     try:
-        # If direct tag, we prepend a specific instruction to ensure she answers the tag
-        instruction = "### MDM TEO SAYS:"
-        if direct_tag:
-            instruction = "### URGENT: You were just tagged/replied to. Check if the user asked a question. If yes, ANSWER IT FIRST based on the context log. Then add your personality. ### MDM TEO SAYS:"
+        if direct_tag and tag_message:
+            instruction = (
+                f"### URGENT INSTRUCTION:\n"
+                f"The user just asked you this specific question: \"{tag_message}\"\n"
+                f"You MUST answer ONLY this question. Do NOT answer previous questions found in the logs.\n"
+                f"Use the 'Conversation Log' below only for context (to see what they were talking about before).\n"
+                f"### MDM TEO SAYS:"
+            )
+        else:
+            instruction = "### MDM TEO SAYS:"
 
         full_prompt = f"{BASE_PROMPT}\n\n### LOG (Last 30 messages):\n{transcript}\n\n{instruction}"
         response = model.generate_content(full_prompt)
@@ -161,6 +191,30 @@ async def process_batch(chat_id, context, direct_tag=False, tag_message=None):
 
     except Exception as e:
         logging.error(f"AI Error: {e}")
+
+async def process_image(chat_id, context, user_handle, caption, photo_file):
+    """Handles image analysis"""
+    logging.info(f">> Processing IMAGE for {chat_id}...")
+    
+    try:
+        # Download image into memory
+        image_bytes = await photo_file.download_as_bytearray()
+        image = Image.open(io.BytesIO(image_bytes))
+
+        # Build prompt
+        prompt_text = f"{BASE_PROMPT}\n\n### EVENT: @{user_handle} just sent a photo."
+        if caption:
+            prompt_text += f"\nCaption: \"{caption}\""
+        prompt_text += "\n\n### YOUR TASK: Look at the photo and roast/judge it like a Singaporean grandmother."
+
+        # Send to Gemini (Multimodal Request)
+        response = model.generate_content([prompt_text, image])
+        reply_text = response.text.strip()
+
+        await context.bot.send_message(chat_id=chat_id, text=reply_text)
+
+    except Exception as e:
+        logging.error(f"Image Error: {e}")
 
 # --- 6. ADMIN COMMANDS ---
 
